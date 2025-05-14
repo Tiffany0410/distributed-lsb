@@ -15,6 +15,7 @@
 
 #include <mpi.h>
 #include <pcg_random.hpp>
+#include <immintrin.h>
 
 // Note: this code assumes that errors returned by MPI calls do not need to be
 // handled. That's the case if they are set to halt the program or
@@ -225,10 +226,51 @@ void localShuffle(std::vector<SortElement>& A,
   counts.fill(0);
 
   // compute the count for each digit
-  for (int64_t i = 0; i < n; i++) {
-    SortElement elt = A[i];
-    counts[getBucket(elt, digit)] += 1;
+  #ifdef USE_OMP_HISTOGRAM
+  // OpenMP parallel histogram with private copies
+  int num_threads = omp_get_max_threads();
+  std::vector<counts_array_t> thread_counts(num_threads);
+
+  #pragma omp parallel
+  {
+    int tid = omp_get_thread_num();
+    auto& local_counts = thread_counts[tid];
+    local_counts.fill(0);
+
+    #pragma omp for schedule(static)
+    for (int64_t i = 0; i < n; ++i) {
+      int b = getBucket(A[i], digit);
+      local_counts[b]++;
+    }
   }
+  // Combine thread-local counts
+  for (int t = 0; t < num_threads; ++t) {
+    for (int i = 0; i < COUNTS_SIZE; ++i) {
+      counts[i] += thread_counts[t][i];
+    }
+  }
+  #elif defined(USE_SIMD)
+  // SIMD histogram logic (AVX2)
+  __m256i mask = _mm256_set1_epi64x(MASK);
+  int64_t i = 0;
+  for (; i + 4 <= n; i += 4) {
+    __m256i keys = _mm256_set_epi64x(A[i+3].key, A[i+2].key, A[i+1].key, A[i].key);
+    __m256i bucket = _mm256_and_si256(_mm256_srli_epi64(keys, RADIX * digit), mask);
+    uint64_t buckets[4];
+    _mm256_storeu_si256((__m256i*)buckets, bucket);
+    for (int j = 0; j < 4; ++j) {
+      counts[buckets[j]]++;
+    }
+  }
+  for (; i < n; ++i) {
+    counts[getBucket(A[i], digit)]++;
+  }
+  #else
+  // Scalar fallback
+  for (int64_t i = 0; i < n; i++) {
+    counts[getBucket(A[i], digit)]++;
+  }
+  #endif
 
   // compute the starts with an exclusive scan
   {
