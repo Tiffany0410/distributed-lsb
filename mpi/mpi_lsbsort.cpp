@@ -11,6 +11,8 @@
 
 #include <unistd.h>
 
+#include <omp.h>
+
 #include <mpi.h>
 #include <pcg_random.hpp>
 
@@ -313,15 +315,41 @@ void myMpiAllToAllV(const std::vector<T>& sendBuf,
   }
 
   // now do the MPI_Alltoallv to transfer the data
-  MPI_Alltoallv(/*sendbuf*/ &sendBuf[0],
-                /*sendcounts*/ &sendCounts[0],
-                /*sdispls*/ &sendDisplacements[0],
-                dt,
-                /*recvbuf*/ &recvBuf[0],
-                /*recvcounts*/ &recvCounts[0],
-                /*rdispls*/ &recvDisplacements[0],
-                dt,
+  // MPI_Alltoallv(/*sendbuf*/ &sendBuf[0],
+  //               /*sendcounts*/ &sendCounts[0],
+  //               /*sdispls*/ &sendDisplacements[0],
+  //               dt,
+  //               /*recvbuf*/ &recvBuf[0],
+  //               /*recvcounts*/ &recvCounts[0],
+  //               /*rdispls*/ &recvDisplacements[0],
+  //               dt,
+  //               MPI_COMM_WORLD);
+
+  #ifdef USE_ASYNC_ALLTOALLV
+  MPI_Request req;
+  /* 1.  Start the transfer (non-blocking) */
+  MPI_Ialltoallv(&sendBuf[0], &sendCounts[0], &sendDisplacements[0], dt,
+                  &recvBuf[0], &recvCounts[0], &recvDisplacements[0], dt,
+                  MPI_COMM_WORLD, &req);
+  
+  /* 2.  While the network is busy, touch the receive pages once so the OS
+          maps them (hides TLB / page-fault latency later).                 */
+  const std::size_t page   = 4096;
+  char*              bytes = reinterpret_cast<char*>(&recvBuf[0]);
+  for (std::size_t off = 0;
+        off < recvBuf.size()*sizeof(T);
+        off += page) {
+    volatile char sink = bytes[off];
+    (void)sink;
+  }
+  
+  /* 3.  Finish the transfer */
+  MPI_Wait(&req, MPI_STATUS_IGNORE);
+  #else
+  MPI_Alltoallv(&sendBuf[0], &sendCounts[0], &sendDisplacements[0], dt,
+                &recvBuf[0], &recvCounts[0], &recvDisplacements[0], dt,
                 MPI_COMM_WORLD);
+  #endif
 }
 
 void copyCountsToGlobalCounts(counts_array_t& localCounts,
